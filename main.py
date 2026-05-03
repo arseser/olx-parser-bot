@@ -1,8 +1,7 @@
 import asyncio
 import logging
 import re
-from datetime import datetime
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,15 +14,15 @@ from aiogram.utils import executor
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO)
 
-# ---------- ТОКЕН (вставлен) ----------
+# ---------- ТОКЕН ----------
 BOT_TOKEN = "8663065329:AAGsTfadlYYtBviD5-RXHHJf4YUBEzoqymw"
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# ---------- ДАННЫЕ ПОЛЬЗОВАТЕЛЯ В ОПЕРАТИВКЕ ----------
-user_data = {}
+# ---------- ХРАНИЛИЩЕ НАСТРОЕК ----------
+saved_filters = {}
 
 # ---------- ДОМЕНЫ OLX ----------
 OLX_DOMAINS = {
@@ -38,33 +37,50 @@ class ParserStates(StatesGroup):
     typing_category = State()
     typing_price_from = State()
     typing_price_to = State()
-    typing_max_reviews = State()
-    typing_min_sold = State()
-    typing_min_active = State()
-    typing_min_reg_year = State()
 
-# ---------- КНОПКИ СТАРТА ----------
+# ---------- ГЛАВНОЕ МЕНЮ ----------
+def main_keyboard(has_saved: bool = False):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    if has_saved:
+        kb.add("⚡ Быстрый поиск (сохранённые фильтры)")
+    kb.add("🔄 Новый поиск")
+    return kb
+
+# ---------- СТАРТ ----------
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔄 Начать новый поиск")
+    uid = message.from_user.id
+    has = uid in saved_filters
     await message.answer(
-        "👋 Привет! Я парсер OLX (PL/BG/RO).\n"
-        "Я буду спрашивать фильтры по шагам.\n"
-        "Жми кнопку ниже, чтобы начать.",
-        reply_markup=kb
+        "👋 Привет! Я парсер OLX (Польша/Болгария/Румыния).\n"
+        "Выдаю до 30 объявлений с инфой о продавце.\n\n"
+        + ("✅ Есть сохранённые фильтры — жми Быстрый поиск." if has else "⚠ Сначала настрой поиск."),
+        reply_markup=main_keyboard(has)
     )
 
-@dp.message_handler(lambda msg: msg.text == "🔄 Начать новый поиск")
-async def start_search(message: types.Message, state: FSMContext):
+# ---------- БЫСТРЫЙ ПОИСК ----------
+@dp.message_handler(lambda msg: msg.text == "⚡ Быстрый поиск (сохранённые фильтры)")
+async def quick_search(message: types.Message):
+    uid = message.from_user.id
+    if uid not in saved_filters:
+        await message.answer("❌ Нет сохранённых фильтров.", reply_markup=main_keyboard(False))
+        return
+    data = saved_filters[uid]
+    country_name = OLX_DOMAINS[data['country']]['name']
+    await message.answer(f"⏳ Ищу по сохранённым фильтрам ({country_name})...", reply_markup=types.ReplyKeyboardRemove())
+    results = await parse_olx(data)
+    await send_results(message, results, country_name)
+
+# ---------- НОВЫЙ ПОИСК (ШАГ 1) ----------
+@dp.message_handler(lambda msg: msg.text == "🔄 Новый поиск")
+async def new_search(message: types.Message, state: FSMContext):
     await state.finish()
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.add("🇵🇱 Польша", "🇧🇬 Болгария")
-    kb.add("🇷🇴 Румыния")
+    kb.add("🇵🇱 Польша", "🇧🇬 Болгария", "🇷🇴 Румыния")
     await message.answer("1️⃣ Выбери страну:", reply_markup=kb)
     await ParserStates.choosing_country.set()
 
-# ---------- ШАГИ ЗАПОЛНЕНИЯ ФИЛЬТРОВ ----------
+# ---------- ШАГИ ----------
 @dp.message_handler(state=ParserStates.choosing_country)
 async def got_country(message: types.Message, state: FSMContext):
     choice = message.text
@@ -78,9 +94,9 @@ async def got_country(message: types.Message, state: FSMContext):
 
     await state.update_data(country=code)
     await message.answer(
-        f"2️⃣ Введи категорию (часть URL после домена).\n"
-        f"Пример: elektronika/telefony-komorkowe\n"
-        f"Или напиши 'пропустить', чтобы искать по всем.",
+        "2️⃣ Введи категорию (часть URL после домена).\n"
+        "Пример: elektronika/telefony-komorkowe\n"
+        "Или 'пропустить' — все категории.",
         reply_markup=types.ReplyKeyboardRemove()
     )
     await ParserStates.typing_category.set()
@@ -91,105 +107,71 @@ async def got_category(message: types.Message, state: FSMContext):
     if cat == "пропустить":
         cat = ""
     await state.update_data(category=cat)
-    await message.answer("3️⃣ Цена ОТ (в злотых/левах/леях). Напиши число или 'пропустить':")
+    await message.answer("3️⃣ Цена ОТ (число или 'пропустить'):")
     await ParserStates.typing_price_from.set()
 
 @dp.message_handler(state=ParserStates.typing_price_from)
 async def got_price_from(message: types.Message, state: FSMContext):
     val = message.text.strip().lower()
     await state.update_data(price_from=val if val != "пропустить" else "")
-    await message.answer("4️⃣ Цена ДО. Число или 'пропустить':")
+    await message.answer("4️⃣ Цена ДО (число или 'пропустить'):")
     await ParserStates.typing_price_to.set()
 
 @dp.message_handler(state=ParserStates.typing_price_to)
 async def got_price_to(message: types.Message, state: FSMContext):
     val = message.text.strip().lower()
     await state.update_data(price_to=val if val != "пропустить" else "")
-    await message.answer("5️⃣ Максимум отрицательных отзывов у продавца (допустим, 0, 3, 5):")
-    await ParserStates.typing_max_reviews.set()
-
-@dp.message_handler(state=ParserStates.typing_max_reviews)
-async def got_max_reviews(message: types.Message, state: FSMContext):
-    try:
-        rev = int(message.text.strip())
-        await state.update_data(max_neg_reviews=rev)
-    except:
-        await state.update_data(max_neg_reviews=999)
-    await message.answer("6️⃣ Минимальное КОЛИЧЕСТВО ПРОДАННЫХ товаров у продавца (введи число, например 10):")
-    await ParserStates.typing_min_sold.set()
-
-@dp.message_handler(state=ParserStates.typing_min_sold)
-async def got_min_sold(message: types.Message, state: FSMContext):
-    try:
-        sold = int(message.text.strip())
-        await state.update_data(min_sold=sold)
-    except:
-        await state.update_data(min_sold=0)
-    await message.answer("7️⃣ Минимальное количество АКТИВНЫХ объявлений у продавца (число, например 5):")
-    await ParserStates.typing_min_active.set()
-
-@dp.message_handler(state=ParserStates.typing_min_active)
-async def got_min_active(message: types.Message, state: FSMContext):
-    try:
-        act = int(message.text.strip())
-        await state.update_data(min_active=act)
-    except:
-        await state.update_data(min_active=0)
-    await message.answer("8️⃣ Минимальный ГОД регистрации продавца на OLX (например 2018):")
-    await ParserStates.typing_min_reg_year.set()
-
-# ---------- ФИНАЛЬНЫЙ ШАГ: ЗАПУСК ПАРСИНГА ----------
-@dp.message_handler(state=ParserStates.typing_min_reg_year)
-async def got_reg_year(message: types.Message, state: FSMContext):
-    try:
-        year = int(message.text.strip())
-        await state.update_data(min_reg_year=year)
-    except:
-        await state.update_data(min_reg_year=0)
     
     data = await state.get_data()
-    await message.answer("⏳ Ищу объявления, это может занять до минуты...")
     await state.finish()
-
+    
+    # Сохраняем фильтры
+    uid = message.from_user.id
+    saved_filters[uid] = data
+    
+    country_name = OLX_DOMAINS[data['country']]['name']
+    await message.answer(f"⏳ Ищу объявления ({country_name})...")
+    
     results = await parse_olx(data)
+    await send_results(message, results, country_name)
 
+# ---------- ОТПРАВКА РЕЗУЛЬТАТОВ ----------
+async def send_results(message: types.Message, results: list, country_name: str):
     if not results:
-        await message.answer("😔 Ничего не нашлось под такие фильтры. Попробуй ослабить параметры.", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("🔄 Начать новый поиск"))
+        kb = main_keyboard(message.from_user.id in saved_filters)
+        await message.answer("😔 Вообще ничего не нашлось. Попробуй другую категорию или страну.", reply_markup=kb)
         return
-
-    for i, item in enumerate(results[:30], 1):
+    
+    await message.answer(f"📊 Найдено объявлений: {len(results)} ({country_name})")
+    
+    for i, item in enumerate(results, 1):
         msg_text = (
             f"🔗 {item['link']}\n"
-            f"👤 {item['seller']}\n"
-            f"📅 На OLX с {item['reg_date'] or 'неизвестно'}\n"
+            f"👤 Продавец: {item['seller']}\n"
+            f"📅 На OLX с: {item['reg_date']}\n"
             f"⭐ Отзывы: {item['reviews']}\n"
             f"📦 Продано: {item['sold']}\n"
-            f"📋 Объявлений: {item['active_ads']}\n"
+            f"📋 Активных: {item['active_ads']}\n"
             f"💰 Цена: {item['price']}\n"
             f"📝 {item['title'][:80]}"
         )
         await message.answer(msg_text, disable_web_page_preview=False)
         if i % 10 == 0:
             await asyncio.sleep(1.5)
+    
+    kb = main_keyboard(message.from_user.id in saved_filters)
+    await message.answer(f"✅ Готово! {country_name} — показано {len(results)} объявлений.", reply_markup=kb)
 
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔄 Начать новый поиск")
-    await message.answer(f"✅ Готово! Показано до 30 объявлений.", reply_markup=kb)
-
-# ---------- ЯДРО ПАРСЕРА ----------
+# ---------- ПАРСЕР ----------
 async def parse_olx(data: dict) -> list:
     country = data.get("country", "pl")
     domain = OLX_DOMAINS[country]["domain"]
     category = data.get("category", "")
     price_from = data.get("price_from", "")
     price_to = data.get("price_to", "")
-    max_neg_reviews = data.get("max_neg_reviews", 999)
-    min_sold = data.get("min_sold", 0)
-    min_active = data.get("min_active", 0)
-    min_reg_year = data.get("min_reg_year", 0)
 
     results = []
-    for page in range(1, 4):
+    for page in range(1, 4):  # 3 страницы = ~30+ объявлений
         url = f"https://m.{domain}/"
         if category:
             url += f"{category}/"
@@ -225,13 +207,26 @@ async def parse_olx(data: dict) -> list:
                 price_el = offer.select_one(".price, [data-testid='listing-price']")
                 price = price_el.get_text(strip=True) if price_el else "N/A"
 
-                seller_info = await get_seller_info(link, min_reg_year, max_neg_reviews, min_sold, min_active)
+                # Парсим продавца БЕЗ фильтрации (всегда добавляем)
+                seller_info = await get_seller_info(link)
                 if seller_info:
                     results.append({
                         "title": title,
                         "price": price,
                         "link": link,
                         **seller_info
+                    })
+                else:
+                    # Даже если продавец не распарсился — добавляем хоть что-то
+                    results.append({
+                        "title": title,
+                        "price": price,
+                        "link": link,
+                        "seller": "Неизвестно",
+                        "reg_date": "???",
+                        "reviews": "???",
+                        "sold": "???",
+                        "active_ads": "???"
                     })
 
                 await asyncio.sleep(0.3)
@@ -241,8 +236,8 @@ async def parse_olx(data: dict) -> list:
 
     return results
 
-# ---------- ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ПРОДАВЦЕ ----------
-async def get_seller_info(offer_url: str, min_reg_year: int, max_neg_reviews: int, min_sold: int, min_active: int) -> dict:
+# ---------- ИНФА О ПРОДАВЦЕ (БЕЗ ФИЛЬТРОВ, ПРОСТО СОБИРАЕМ) ----------
+async def get_seller_info(offer_url: str) -> dict:
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
         "Accept-Language": "pl,en;q=0.9",
@@ -251,57 +246,52 @@ async def get_seller_info(offer_url: str, min_reg_year: int, max_neg_reviews: in
         resp = requests.get(offer_url, headers=headers, timeout=10)
         soup = BeautifulSoup(resp.text, "html.parser")
 
+        # Продавец
         seller_name = "Неизвестно"
         seller_el = soup.select_one(".user-image__name, [data-testid='seller-name'], .css-12hdxwj")
         if seller_el:
             seller_name = seller_el.get_text(strip=True)
 
-        reg_date = None
+        # Год регистрации
+        reg_date = "???"
         reg_text = soup.get_text()
-        reg_match = re.search(r"(?:на сервисе с|registered since|od)\s*(\d{4})", reg_text, re.IGNORECASE)
+        reg_match = re.search(r"(?:на сервисе с|registered since|od|на сайта от)\s*(\d{4})", reg_text, re.IGNORECASE)
         if reg_match:
-            reg_year = int(reg_match.group(1))
-            if reg_year < min_reg_year:
-                return None
-            reg_date = reg_match.group(1)
+            reg_date = reg_match.group(1) + " г."
 
+        # Отзывы
         reviews_text = ""
         review_el = soup.select_one(".user-stats__reviews, [data-testid='rating']")
         if review_el:
             reviews_text = review_el.get_text(strip=True)
         
-        neg_count = 0
+        neg_count = "0"
         neg_match = re.search(r"(\d+)\s*(?:негативн|negative|negatywn)", reviews_text, re.IGNORECASE)
         if neg_match:
-            neg_count = int(neg_match.group(1))
-        if neg_count > max_neg_reviews:
-            return None
+            neg_count = neg_match.group(1)
 
-        sold_count = 0
-        active_count = 0
+        # Продано / Активные
+        sold_count = "0"
+        active_count = "0"
         stats_el = soup.select_one(".user-stats, [data-testid='seller-stats']")
         if stats_el:
             stats_text = stats_el.get_text()
             sold_match = re.search(r"(\d+)\s*(?:продано|sold|sprzedane)", stats_text, re.IGNORECASE)
             active_match = re.search(r"(\d+)\s*(?:активн|active|aktywn)", stats_text, re.IGNORECASE)
-            if sold_match: sold_count = int(sold_match.group(1))
-            if active_match: active_count = int(active_match.group(1))
-        
-        if sold_count < min_sold or active_count < min_active:
-            return None
+            if sold_match: sold_count = sold_match.group(1)
+            if active_match: active_count = active_match.group(1)
 
         return {
             "seller": seller_name,
-            "reg_date": f"{reg_date} г." if reg_date else "???",
+            "reg_date": reg_date,
             "reviews": f"{neg_count} негативных",
             "sold": sold_count,
             "active_ads": active_count
         }
 
-    except Exception as e:
-        logging.warning(f"Не смог распарсить продавца {offer_url}: {e}")
+    except:
         return None
 
-# ---------- ЗАПУСК БОТА ----------
+# ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
